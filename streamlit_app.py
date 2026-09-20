@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import hashlib
 import secrets
+import random
 from datetime import datetime, timedelta, date
 
 # ============================================================
@@ -32,21 +33,37 @@ FOCUS_CATEGORIES = [
 SESSION_TIMEOUT_SECONDS = 300
 HEARTBEAT_SECONDS = 30
 
+QUESTION_TYPES = [
+    "MCQ",
+    "MSQ",
+    "NAT",
+]
+
+MASTERY_THRESHOLD = 90.0
+
+
 # ============================================================
 # DATABASE
 # ============================================================
 
-
 def get_db():
+
     conn = sqlite3.connect(
         DB_FILE,
         check_same_thread=False,
     )
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
-def column_exists(conn, table_name, column_name):
+def column_exists(
+    conn,
+    table_name,
+    column_name,
+):
+
     columns = conn.execute(
         f"PRAGMA table_info({table_name})"
     ).fetchall()
@@ -63,15 +80,18 @@ def add_column_if_missing(
     column_name,
     column_definition,
 ):
+
     if not column_exists(
         conn,
         table_name,
         column_name,
     ):
+
         conn.execute(
             f"""
             ALTER TABLE {table_name}
-            ADD COLUMN {column_name} {column_definition}
+            ADD COLUMN {column_name}
+            {column_definition}
             """
         )
 
@@ -79,6 +99,7 @@ def add_column_if_missing(
 def init_database():
 
     conn = get_db()
+
     cur = conn.cursor()
 
     # --------------------------------------------------------
@@ -114,6 +135,11 @@ def init_database():
             start_time TEXT NOT NULL,
             end_time TEXT,
             duration_minutes INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'COMPLETED',
+            last_heartbeat TEXT,
+            active_seconds INTEGER DEFAULT 0,
+            paused_seconds INTEGER DEFAULT 0,
+            last_activity TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
@@ -180,7 +206,7 @@ def init_database():
     )
 
     # --------------------------------------------------------
-    # TOPIC REVISION
+    # REVISION QUEUE
     # --------------------------------------------------------
 
     cur.execute(
@@ -200,54 +226,394 @@ def init_database():
     )
 
     # --------------------------------------------------------
-    # PHASE 3 MIGRATION COLUMNS
+    # QUESTIONS
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            question_text TEXT NOT NULL,
+            question_type TEXT NOT NULL,
+            option_a TEXT,
+            option_b TEXT,
+            option_c TEXT,
+            option_d TEXT,
+            correct_answer TEXT NOT NULL,
+            explanation TEXT,
+            difficulty INTEGER DEFAULT 2,
+            source_type TEXT DEFAULT 'ORIGINAL',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    # --------------------------------------------------------
+    # QUESTION RESPONSES
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS question_responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            selected_answer TEXT,
+            is_correct INTEGER NOT NULL,
+            response_time_seconds INTEGER DEFAULT 0,
+            attempted_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(question_id) REFERENCES questions(id)
+        )
+        """
+    )
+
+    # --------------------------------------------------------
+    # CBT SESSIONS
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cbt_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            session_type TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            total_questions INTEGER DEFAULT 0,
+            attempted_questions INTEGER DEFAULT 0,
+            correct_questions INTEGER DEFAULT 0,
+            score REAL DEFAULT 0,
+            status TEXT DEFAULT 'ACTIVE',
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    # --------------------------------------------------------
+    # CBT SESSION QUESTIONS
+    # --------------------------------------------------------
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cbt_session_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cbt_session_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            question_order INTEGER NOT NULL,
+            selected_answer TEXT,
+            is_correct INTEGER,
+            answered INTEGER DEFAULT 0,
+            FOREIGN KEY(cbt_session_id) REFERENCES cbt_sessions(id),
+            FOREIGN KEY(question_id) REFERENCES questions(id)
+        )
+        """
+    )
+
+    # --------------------------------------------------------
+    # PHASE 4 MIGRATION
     # --------------------------------------------------------
 
     add_column_if_missing(
         conn,
-        "focus_sessions",
-        "status",
-        "TEXT DEFAULT 'COMPLETED'",
+        "study_progress",
+        "mastery_status",
+        "TEXT DEFAULT 'NOT_STARTED'",
     )
 
     add_column_if_missing(
         conn,
-        "focus_sessions",
-        "last_heartbeat",
+        "study_progress",
+        "last_attempt_at",
         "TEXT",
     )
 
     add_column_if_missing(
         conn,
-        "focus_sessions",
-        "active_seconds",
-        "INTEGER DEFAULT 0",
-    )
-
-    add_column_if_missing(
-        conn,
-        "focus_sessions",
-        "paused_seconds",
-        "INTEGER DEFAULT 0",
-    )
-
-    add_column_if_missing(
-        conn,
-        "focus_sessions",
-        "last_activity",
-        "TEXT",
+        "study_progress",
+        "weakness_score",
+        "REAL DEFAULT 0",
     )
 
     conn.commit()
+
     conn.close()
 
 
 init_database()
 
+
+# ============================================================
+# ORIGINAL GATE-STYLE QUESTION BANK
+# ============================================================
+
+ORIGINAL_QUESTIONS = [
+
+    {
+        "subject": "Engineering Mechanics",
+        "topic": "Equilibrium",
+        "text": (
+            "A body is in static equilibrium under coplanar "
+            "forces. Which condition must be satisfied?"
+        ),
+        "type": "MCQ",
+        "a": "Only sum of forces is zero",
+        "b": "Only sum of moments is zero",
+        "c": "Sum of forces and moments are both zero",
+        "d": "Velocity must be constant",
+        "answer": "C",
+        "explanation": (
+            "For planar static equilibrium, both the resultant "
+            "force and resultant moment must be zero."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Mechanics of Materials",
+        "topic": "Stress and Strain",
+        "text": (
+            "A uniform bar carries an axial tensile load P. "
+            "If its cross-sectional area is A, the normal stress is:"
+        ),
+        "type": "MCQ",
+        "a": "P/A",
+        "b": "A/P",
+        "c": "P+A",
+        "d": "P-A",
+        "answer": "A",
+        "explanation": (
+            "Normal stress is defined as axial force divided "
+            "by cross-sectional area."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Thermodynamics",
+        "topic": "First Law",
+        "text": (
+            "For a closed system, neglecting changes in kinetic "
+            "and potential energy, the first law relates heat, "
+            "work and change in internal energy."
+        ),
+        "type": "MCQ",
+        "a": "Q = W + ΔU",
+        "b": "Q = W - ΔU",
+        "c": "Q = ΔU - W",
+        "d": "Q = 0 always",
+        "answer": "A",
+        "explanation": (
+            "Using the convention of work done by the system, "
+            "Q = ΔU + W."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Fluid Mechanics",
+        "topic": "Bernoulli Equation",
+        "text": (
+            "For steady incompressible inviscid flow along a "
+            "streamline, which quantity remains constant?"
+        ),
+        "type": "MCQ",
+        "a": "Mass flow rate only",
+        "b": "Total mechanical energy per unit weight",
+        "c": "Velocity only",
+        "d": "Pressure only",
+        "answer": "B",
+        "explanation": (
+            "Bernoulli's equation represents conservation of "
+            "mechanical energy per unit weight."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Heat Transfer",
+        "topic": "Conduction",
+        "text": (
+            "For one-dimensional steady conduction through a "
+            "plane wall with constant thermal conductivity, "
+            "the temperature profile is:"
+        ),
+        "type": "MCQ",
+        "a": "Linear",
+        "b": "Parabolic",
+        "c": "Exponential",
+        "d": "Sinusoidal",
+        "answer": "A",
+        "explanation": (
+            "For constant conductivity and no internal heat "
+            "generation, the temperature distribution is linear."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Manufacturing",
+        "topic": "Machining",
+        "text": (
+            "In orthogonal cutting, the cutting velocity is "
+            "normally considered perpendicular to the cutting edge."
+        ),
+        "type": "MCQ",
+        "a": "True",
+        "b": "False",
+        "c": "Only for grinding",
+        "d": "Only for casting",
+        "answer": "A",
+        "explanation": (
+            "Orthogonal cutting is an idealized two-dimensional "
+            "cutting model."
+        ),
+        "difficulty": 2,
+    },
+
+    {
+        "subject": "Theory of Machines",
+        "topic": "Gears",
+        "text": (
+            "For two externally meshing gears, the direction "
+            "of rotation of the gears is:"
+        ),
+        "type": "MCQ",
+        "a": "Same",
+        "b": "Opposite",
+        "c": "Always zero",
+        "d": "Independent of gearing",
+        "answer": "B",
+        "explanation": (
+            "External gears rotate in opposite directions."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Industrial Engineering",
+        "topic": "Inventory",
+        "text": (
+            "The economic order quantity model primarily attempts "
+            "to balance ordering cost and:"
+        ),
+        "type": "MCQ",
+        "a": "Holding cost",
+        "b": "Machine cost",
+        "c": "Labour wage",
+        "d": "Transportation speed",
+        "answer": "A",
+        "explanation": (
+            "EOQ balances ordering cost against inventory holding cost."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Machine Design",
+        "topic": "Shafts",
+        "text": (
+            "A circular shaft subjected to pure torsion develops "
+            "maximum shear stress at:"
+        ),
+        "type": "MCQ",
+        "a": "Centre",
+        "b": "Outer surface",
+        "c": "Mid-radius",
+        "d": "Everywhere equally",
+        "answer": "B",
+        "explanation": (
+            "For a circular shaft, shear stress varies linearly "
+            "with radius and is maximum at the outer surface."
+        ),
+        "difficulty": 1,
+    },
+
+    {
+        "subject": "Engineering Mathematics",
+        "topic": "Linear Algebra",
+        "text": (
+            "For a square matrix, a zero determinant indicates that "
+            "the matrix is:"
+        ),
+        "type": "MCQ",
+        "a": "Singular",
+        "b": "Orthogonal",
+        "c": "Identity",
+        "d": "Diagonal",
+        "answer": "A",
+        "explanation": (
+            "A square matrix with zero determinant is singular "
+            "and does not have an ordinary inverse."
+        ),
+        "difficulty": 1,
+    },
+
+]
+
+
+def seed_questions():
+
+    conn = get_db()
+
+    count = conn.execute(
+        "SELECT COUNT(*) AS c FROM questions"
+    ).fetchone()["c"]
+
+    if count == 0:
+
+        for q in ORIGINAL_QUESTIONS:
+
+            conn.execute(
+                """
+                INSERT INTO questions
+                (
+                    subject,
+                    topic,
+                    question_text,
+                    question_type,
+                    option_a,
+                    option_b,
+                    option_c,
+                    option_d,
+                    correct_answer,
+                    explanation,
+                    difficulty,
+                    source_type,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    q["subject"],
+                    q["topic"],
+                    q["text"],
+                    q["type"],
+                    q["a"],
+                    q["b"],
+                    q["c"],
+                    q["d"],
+                    q["answer"],
+                    q["explanation"],
+                    q["difficulty"],
+                    "ORIGINAL",
+                    datetime.now().isoformat(),
+                ),
+            )
+
+        conn.commit()
+
+    conn.close()
+
+
+seed_questions()
+
+
 # ============================================================
 # PASSWORD SECURITY
 # ============================================================
-
 
 def hash_password(password):
 
@@ -285,13 +651,13 @@ def verify_password(
         )
 
     except Exception:
+
         return False
 
 
 # ============================================================
 # USER FUNCTIONS
 # ============================================================
-
 
 def create_user(
     email,
@@ -303,7 +669,9 @@ def create_user(
 
     try:
 
-        password_hash = hash_password(password)
+        password_hash = hash_password(
+            password
+        )
 
         cur = conn.cursor()
 
@@ -368,6 +736,7 @@ def authenticate(
         password,
         user["password_hash"],
     ):
+
         return dict(user)
 
     return None
@@ -397,7 +766,7 @@ def get_user(user_id):
 # SESSION STATE
 # ============================================================
 
-DEFAULT_SESSION_VALUES = {
+DEFAULT_STATE = {
     "logged_in": False,
     "user_id": None,
     "focus_running": False,
@@ -405,244 +774,490 @@ DEFAULT_SESSION_VALUES = {
     "focus_category": None,
     "focus_start": None,
     "focus_last_activity": None,
-    "focus_active_seconds": 0,
     "focus_status": "STOPPED",
     "last_heartbeat": None,
+    "cbt_session_id": None,
+    "cbt_question_index": 0,
+    "cbt_started": None,
 }
 
-for key, value in DEFAULT_SESSION_VALUES.items():
+for key, value in DEFAULT_STATE.items():
 
     if key not in st.session_state:
         st.session_state[key] = value
 
 
 # ============================================================
-# LOGIN / REGISTER
+# TIME HELPERS
 # ============================================================
 
+def now():
 
-def authentication_screen():
+    return datetime.now()
 
-    st.title("⚙️ GATE ME")
 
-    st.subheader(
-        "Mechanical Engineering Preparation Platform"
+def parse_datetime(value):
+
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(value)
+
+    except Exception:
+
+        return None
+
+
+def format_duration(seconds):
+
+    seconds = max(
+        0,
+        int(seconds),
     )
 
-    st.write(
-        "Create your student account or login to continue."
-    )
+    hours = seconds // 3600
 
-    login_tab, register_tab = st.tabs(
-        [
-            "🔐 Login",
-            "📝 Create Account",
-        ]
-    )
+    minutes = (
+        seconds % 3600
+    ) // 60
 
-    # --------------------------------------------------------
-    # LOGIN
-    # --------------------------------------------------------
+    secs = seconds % 60
 
-    with login_tab:
+    if hours:
 
-        st.subheader("Student Login")
-
-        email = st.text_input(
-            "Email",
-            key="login_email",
+        return (
+            f"{hours}h "
+            f"{minutes}m "
+            f"{secs}s"
         )
 
-        password = st.text_input(
-            "Password",
-            type="password",
-            key="login_password",
+    return (
+        f"{minutes}m "
+        f"{secs}s"
+    )
+
+
+# ============================================================
+# FOCUS FUNCTIONS
+# ============================================================
+
+def create_focus_session(
+    user_id,
+    category,
+):
+
+    timestamp = now().isoformat()
+
+    conn = get_db()
+
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO focus_sessions
+        (
+            user_id,
+            category,
+            start_time,
+            status,
+            last_heartbeat,
+            active_seconds,
+            paused_seconds,
+            last_activity
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            category,
+            timestamp,
+            "ACTIVE",
+            timestamp,
+            0,
+            0,
+            timestamp,
+        ),
+    )
+
+    session_id = cur.lastrowid
+
+    conn.execute(
+        """
+        INSERT INTO study_events
+        (
+            user_id,
+            session_id,
+            event_type,
+            event_time,
+            category,
+            duration_seconds
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            session_id,
+            "SESSION_STARTED",
+            timestamp,
+            category,
+            0,
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return session_id
+
+
+def confirm_focus_activity(
+    user_id,
+    session_id,
+):
+
+    current = now()
+
+    conn = get_db()
+
+    session = conn.execute(
+        """
+        SELECT *
+        FROM focus_sessions
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            session_id,
+            user_id,
+        ),
+    ).fetchone()
+
+    if not session:
+
+        conn.close()
+
+        return False
+
+    previous = parse_datetime(
+        session["last_activity"]
+    )
+
+    increment = 0
+
+    if previous:
+
+        elapsed = (
+            current - previous
+        ).total_seconds()
+
+        increment = min(
+            max(
+                0,
+                int(elapsed),
+            ),
+            SESSION_TIMEOUT_SECONDS,
         )
 
-        if st.button(
-            "Login",
-            type="primary",
-            use_container_width=True,
+    active_seconds = (
+        session["active_seconds"] or 0
+    ) + increment
+
+    conn.execute(
+        """
+        UPDATE focus_sessions
+        SET
+            status = 'ACTIVE',
+            last_activity = ?,
+            last_heartbeat = ?,
+            active_seconds = ?
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            current.isoformat(),
+            current.isoformat(),
+            active_seconds,
+            session_id,
+            user_id,
+        ),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO study_events
+        (
+            user_id,
+            session_id,
+            event_type,
+            event_time,
+            category,
+            duration_seconds
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            session_id,
+            "ACTIVITY_CONFIRMED",
+            current.isoformat(),
+            session["category"],
+            increment,
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return True
+
+
+def check_focus_inactivity(
+    user_id,
+    session_id,
+):
+
+    current = now()
+
+    conn = get_db()
+
+    session = conn.execute(
+        """
+        SELECT *
+        FROM focus_sessions
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            session_id,
+            user_id,
+        ),
+    ).fetchone()
+
+    if not session:
+
+        conn.close()
+
+        return False
+
+    last_activity = parse_datetime(
+        session["last_activity"]
+    )
+
+    if last_activity:
+
+        inactive_seconds = (
+            current - last_activity
+        ).total_seconds()
+
+        if (
+            inactive_seconds
+            > SESSION_TIMEOUT_SECONDS
+            and session["status"] == "ACTIVE"
         ):
 
-            user = authenticate(
-                email,
-                password,
+            conn.execute(
+                """
+                UPDATE focus_sessions
+                SET status = 'PAUSED_INACTIVE'
+                WHERE id = ?
+                AND user_id = ?
+                """,
+                (
+                    session_id,
+                    user_id,
+                ),
             )
 
-            if user:
-
-                st.session_state.logged_in = True
-                st.session_state.user_id = user["id"]
-
-                st.success(
-                    "Login successful."
+            conn.execute(
+                """
+                INSERT INTO study_events
+                (
+                    user_id,
+                    session_id,
+                    event_type,
+                    event_time,
+                    category
                 )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    session_id,
+                    "AUTO_PAUSED_INACTIVE",
+                    current.isoformat(),
+                    session["category"],
+                ),
+            )
 
-                st.rerun()
+            conn.commit()
 
-            else:
+            conn.close()
 
-                st.error(
-                    "Invalid email or password."
-                )
+            return True
 
-    # --------------------------------------------------------
-    # REGISTER
-    # --------------------------------------------------------
+    conn.close()
 
-    with register_tab:
+    return False
 
-        st.subheader(
-            "Create Student Account"
+
+def pause_focus_session(
+    user_id,
+    session_id,
+):
+
+    conn = get_db()
+
+    conn.execute(
+        """
+        UPDATE focus_sessions
+        SET status = 'PAUSED_MANUAL'
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            session_id,
+            user_id,
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+
+def resume_focus_session(
+    user_id,
+    session_id,
+):
+
+    timestamp = now().isoformat()
+
+    conn = get_db()
+
+    conn.execute(
+        """
+        UPDATE focus_sessions
+        SET
+            status = 'ACTIVE',
+            last_activity = ?,
+            last_heartbeat = ?
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            timestamp,
+            timestamp,
+            session_id,
+            user_id,
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+
+def finalize_focus_session(
+    user_id,
+):
+
+    session_id = (
+        st.session_state.focus_session_id
+    )
+
+    if not session_id:
+        return
+
+    current = now()
+
+    conn = get_db()
+
+    session = conn.execute(
+        """
+        SELECT *
+        FROM focus_sessions
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            session_id,
+            user_id,
+        ),
+    ).fetchone()
+
+    if session:
+
+        active_seconds = (
+            session["active_seconds"] or 0
         )
 
-        name = st.text_input(
-            "Full Name",
-            key="register_name",
+        last_activity = parse_datetime(
+            session["last_activity"]
         )
 
-        email = st.text_input(
-            "Email",
-            key="register_email",
-        )
-
-        password = st.text_input(
-            "Password",
-            type="password",
-            key="register_password",
-        )
-
-        confirm_password = st.text_input(
-            "Confirm Password",
-            type="password",
-            key="register_confirm",
-        )
-
-        if st.button(
-            "Create Account",
-            type="primary",
-            use_container_width=True,
+        if (
+            last_activity
+            and session["status"] == "ACTIVE"
         ):
 
-            if not name.strip():
+            additional = min(
+                max(
+                    0,
+                    int(
+                        (
+                            current
+                            - last_activity
+                        ).total_seconds()
+                    ),
+                ),
+                SESSION_TIMEOUT_SECONDS,
+            )
 
-                st.error(
-                    "Enter your full name."
-                )
+            active_seconds += additional
 
-            elif "@" not in email:
-
-                st.error(
-                    "Enter a valid email address."
-                )
-
-            elif len(password) < 8:
-
-                st.error(
-                    "Password must contain at least 8 characters."
-                )
-
-            elif password != confirm_password:
-
-                st.error(
-                    "Passwords do not match."
-                )
-
-            else:
-
-                success, user_id = create_user(
-                    email,
-                    password,
-                    name,
-                )
-
-                if success:
-
-                    st.session_state.logged_in = True
-                    st.session_state.user_id = user_id
-
-                    st.success(
-                        "Account created successfully."
-                    )
-
-                    st.rerun()
-
-                else:
-
-                    st.error(
-                        "An account with this email already exists."
-                    )
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-
-def sidebar(user):
-
-    with st.sidebar:
-
-        st.title("⚙️ GATE ME")
-
-        st.caption(
-            "GATE Mechanical Engineering"
+        duration_minutes = (
+            active_seconds // 60
         )
 
-        st.divider()
-
-        st.write(
-            f"👤 **{user['full_name']}**"
+        conn.execute(
+            """
+            UPDATE focus_sessions
+            SET
+                end_time = ?,
+                active_seconds = ?,
+                duration_minutes = ?,
+                status = 'COMPLETED'
+            WHERE id = ?
+            AND user_id = ?
+            """,
+            (
+                current.isoformat(),
+                active_seconds,
+                duration_minutes,
+                session_id,
+                user_id,
+            ),
         )
 
-        st.caption(
-            user["email"]
-        )
+        conn.commit()
 
-        st.divider()
+    conn.close()
 
-        page = st.radio(
-            "Navigation",
-            [
-                "🏠 Dashboard",
-                "📚 Syllabus",
-                "⏱️ Focus Mode",
-                "📝 Practice",
-                "📄 PYQs",
-                "🔄 Revision",
-                "📊 Analytics",
-                "🗓️ Study Planner",
-                "👤 Profile",
-            ],
-        )
-
-        st.divider()
-
-        if st.button(
-            "🚪 Logout",
-            use_container_width=True,
-        ):
-
-            # Stop an unfinished focus session safely.
-            if st.session_state.focus_running:
-                finalize_focus_session(
-                    user["id"],
-                    reason="LOGOUT",
-                )
-
-            for key, value in DEFAULT_SESSION_VALUES.items():
-                st.session_state[key] = value
-
-            st.rerun()
-
-    return page
+    st.session_state.focus_running = False
+    st.session_state.focus_session_id = None
+    st.session_state.focus_category = None
+    st.session_state.focus_start = None
+    st.session_state.focus_last_activity = None
+    st.session_state.focus_status = "STOPPED"
+    st.session_state.last_heartbeat = None
 
 
 # ============================================================
 # SYLLABUS
 # ============================================================
-
 
 SYLLABUS = {
 
@@ -753,664 +1368,207 @@ SYLLABUS = {
 
 
 # ============================================================
-# TIME HELPERS
+# AUTHENTICATION SCREEN
 # ============================================================
 
+def authentication_screen():
 
-def now():
-    return datetime.now()
+    st.title("⚙️ GATE ME")
 
-
-def parse_datetime(value):
-
-    if not value:
-        return None
-
-    try:
-        return datetime.fromisoformat(value)
-    except Exception:
-        return None
-
-
-def seconds_between(
-    start,
-    end,
-):
-
-    if not start or not end:
-        return 0
-
-    difference = (
-        end - start
-    ).total_seconds()
-
-    return max(
-        0,
-        int(difference),
+    st.subheader(
+        "Mechanical Engineering Preparation Platform"
     )
 
-
-def format_duration(seconds):
-
-    seconds = max(
-        0,
-        int(seconds),
+    login_tab, register_tab = st.tabs(
+        [
+            "🔐 Login",
+            "📝 Create Account",
+        ]
     )
 
-    hours = seconds // 3600
-    minutes = (
-        seconds % 3600
-    ) // 60
-    secs = seconds % 60
+    with login_tab:
 
-    if hours > 0:
-
-        return (
-            f"{hours}h "
-            f"{minutes}m "
-            f"{secs}s"
+        email = st.text_input(
+            "Email",
+            key="login_email",
         )
 
-    return (
-        f"{minutes}m "
-        f"{secs}s"
-    )
-
-
-# ============================================================
-# FOCUS DATABASE FUNCTIONS
-# ============================================================
-
-
-def create_focus_session(
-    user_id,
-    category,
-):
-
-    timestamp = now().isoformat()
-
-    conn = get_db()
-
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO focus_sessions
-        (
-            user_id,
-            category,
-            start_time,
-            status,
-            last_heartbeat,
-            active_seconds,
-            paused_seconds,
-            last_activity
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            category,
-            timestamp,
-            "ACTIVE",
-            timestamp,
-            0,
-            0,
-            timestamp,
-        ),
-    )
-
-    session_id = cur.lastrowid
-
-    cur.execute(
-        """
-        INSERT INTO study_events
-        (
-            user_id,
-            session_id,
-            event_type,
-            event_time,
-            category,
-            duration_seconds
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            session_id,
-            "SESSION_STARTED",
-            timestamp,
-            category,
-            0,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    return session_id
-
-
-def update_focus_heartbeat(
-    user_id,
-    session_id,
-):
-
-    current = now()
-
-    conn = get_db()
-
-    session = conn.execute(
-        """
-        SELECT *
-        FROM focus_sessions
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            session_id,
-            user_id,
-        ),
-    ).fetchone()
-
-    if not session:
-
-        conn.close()
-        return False
-
-    last_activity = parse_datetime(
-        session["last_activity"]
-    )
-
-    last_heartbeat = parse_datetime(
-        session["last_heartbeat"]
-    )
-
-    # --------------------------------------------------------
-    # INACTIVITY CHECK
-    # --------------------------------------------------------
-
-    if last_activity:
-
-        inactivity = (
-            current - last_activity
-        ).total_seconds()
-
-        if inactivity > SESSION_TIMEOUT_SECONDS:
-
-            conn.execute(
-                """
-                UPDATE focus_sessions
-                SET
-                    status = 'PAUSED_INACTIVE',
-                    last_heartbeat = ?
-                WHERE id = ?
-                AND user_id = ?
-                """,
-                (
-                    current.isoformat(),
-                    session_id,
-                    user_id,
-                ),
-            )
-
-            conn.execute(
-                """
-                INSERT INTO study_events
-                (
-                    user_id,
-                    session_id,
-                    event_type,
-                    event_time,
-                    category,
-                    duration_seconds
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    session_id,
-                    "AUTO_PAUSED_INACTIVE",
-                    current.isoformat(),
-                    session["category"],
-                    0,
-                ),
-            )
-
-            conn.commit()
-            conn.close()
-
-            return "INACTIVE"
-
-    # --------------------------------------------------------
-    # HEARTBEAT
-    # --------------------------------------------------------
-
-    increment = 0
-
-    if last_heartbeat:
-
-        elapsed = (
-            current - last_heartbeat
-        ).total_seconds()
-
-        # Only accept reasonable heartbeat intervals.
-        if 0 < elapsed <= 90:
-
-            increment = int(elapsed)
-
-    active_seconds = (
-        session["active_seconds"] or 0
-    ) + increment
-
-    conn.execute(
-        """
-        UPDATE focus_sessions
-        SET
-            last_heartbeat = ?,
-            active_seconds = ?,
-            last_activity = ?
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            current.isoformat(),
-            active_seconds,
-            session["last_activity"],
-            session_id,
-            user_id,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    return True
-
-
-def confirm_focus_activity(
-    user_id,
-    session_id,
-):
-
-    current = now()
-
-    conn = get_db()
-
-    session = conn.execute(
-        """
-        SELECT *
-        FROM focus_sessions
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            session_id,
-            user_id,
-        ),
-    ).fetchone()
-
-    if not session:
-
-        conn.close()
-        return False
-
-    previous_activity = parse_datetime(
-        session["last_activity"]
-    )
-
-    previous_heartbeat = parse_datetime(
-        session["last_heartbeat"]
-    )
-
-    increment = 0
-
-    if previous_activity:
-
-        elapsed = (
-            current - previous_activity
-        ).total_seconds()
-
-        # Do not credit more than five minutes
-        # from a single confirmation.
-        increment = min(
-            max(0, int(elapsed)),
-            SESSION_TIMEOUT_SECONDS,
+        password = st.text_input(
+            "Password",
+            type="password",
+            key="login_password",
         )
 
-    elif previous_heartbeat:
-
-        elapsed = (
-            current - previous_heartbeat
-        ).total_seconds()
-
-        increment = min(
-            max(0, int(elapsed)),
-            SESSION_TIMEOUT_SECONDS,
-        )
-
-    new_active_seconds = (
-        session["active_seconds"] or 0
-    ) + increment
-
-    conn.execute(
-        """
-        UPDATE focus_sessions
-        SET
-            status = 'ACTIVE',
-            last_activity = ?,
-            last_heartbeat = ?,
-            active_seconds = ?
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            current.isoformat(),
-            current.isoformat(),
-            new_active_seconds,
-            session_id,
-            user_id,
-        ),
-    )
-
-    conn.execute(
-        """
-        INSERT INTO study_events
-        (
-            user_id,
-            session_id,
-            event_type,
-            event_time,
-            category,
-            duration_seconds
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            session_id,
-            "ACTIVITY_CONFIRMED",
-            current.isoformat(),
-            session["category"],
-            increment,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    return True
-
-
-def pause_focus_session(
-    user_id,
-    session_id,
-):
-
-    current = now()
-
-    conn = get_db()
-
-    session = conn.execute(
-        """
-        SELECT *
-        FROM focus_sessions
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            session_id,
-            user_id,
-        ),
-    ).fetchone()
-
-    if session:
-
-        conn.execute(
-            """
-            UPDATE focus_sessions
-            SET status = 'PAUSED_MANUAL'
-            WHERE id = ?
-            AND user_id = ?
-            """,
-            (
-                session_id,
-                user_id,
-            ),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO study_events
-            (
-                user_id,
-                session_id,
-                event_type,
-                event_time,
-                category,
-                duration_seconds
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                session_id,
-                "MANUAL_PAUSE",
-                current.isoformat(),
-                session["category"],
-                0,
-            ),
-        )
-
-    conn.commit()
-    conn.close()
-
-
-def resume_focus_session(
-    user_id,
-    session_id,
-):
-
-    current = now()
-
-    conn = get_db()
-
-    session = conn.execute(
-        """
-        SELECT *
-        FROM focus_sessions
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            session_id,
-            user_id,
-        ),
-    ).fetchone()
-
-    if session:
-
-        conn.execute(
-            """
-            UPDATE focus_sessions
-            SET
-                status = 'ACTIVE',
-                last_activity = ?,
-                last_heartbeat = ?
-            WHERE id = ?
-            AND user_id = ?
-            """,
-            (
-                current.isoformat(),
-                current.isoformat(),
-                session_id,
-                user_id,
-            ),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO study_events
-            (
-                user_id,
-                session_id,
-                event_type,
-                event_time,
-                category,
-                duration_seconds
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                session_id,
-                "SESSION_RESUMED",
-                current.isoformat(),
-                session["category"],
-                0,
-            ),
-        )
-
-    conn.commit()
-    conn.close()
-
-
-def finalize_focus_session(
-    user_id,
-    reason="STOPPED",
-):
-
-    session_id = st.session_state.focus_session_id
-
-    if not session_id:
-        return
-
-    current = now()
-
-    conn = get_db()
-
-    session = conn.execute(
-        """
-        SELECT *
-        FROM focus_sessions
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            session_id,
-            user_id,
-        ),
-    ).fetchone()
-
-    if session:
-
-        # Capture the last confirmed active interval,
-        # but never more than the inactivity threshold.
-        last_activity = parse_datetime(
-            session["last_activity"]
-        )
-
-        active_seconds = (
-            session["active_seconds"] or 0
-        )
-
-        if (
-            last_activity
-            and session["status"] == "ACTIVE"
+        if st.button(
+            "Login",
+            type="primary",
+            use_container_width=True,
         ):
 
-            final_increment = min(
-                max(
-                    0,
-                    int(
-                        (
-                            current
-                            - last_activity
-                        ).total_seconds()
-                    ),
-                ),
-                SESSION_TIMEOUT_SECONDS,
+            user = authenticate(
+                email,
+                password,
             )
 
-            active_seconds += final_increment
+            if user:
 
-        duration_minutes = max(
-            0,
-            active_seconds // 60,
+                st.session_state.logged_in = True
+                st.session_state.user_id = user["id"]
+
+                st.rerun()
+
+            else:
+
+                st.error(
+                    "Invalid email or password."
+                )
+
+    with register_tab:
+
+        name = st.text_input(
+            "Full Name",
+            key="register_name",
         )
 
-        status = (
-            "COMPLETED"
-            if reason == "STOPPED"
-            else reason
+        email = st.text_input(
+            "Email",
+            key="register_email",
         )
 
-        conn.execute(
-            """
-            UPDATE focus_sessions
-            SET
-                end_time = ?,
-                duration_minutes = ?,
-                active_seconds = ?,
-                status = ?
-            WHERE id = ?
-            AND user_id = ?
-            """,
-            (
-                current.isoformat(),
-                duration_minutes,
-                active_seconds,
-                status,
-                session_id,
-                user_id,
-            ),
+        password = st.text_input(
+            "Password",
+            type="password",
+            key="register_password",
         )
 
-        conn.execute(
-            """
-            INSERT INTO study_events
-            (
-                user_id,
-                session_id,
-                event_type,
-                event_time,
-                category,
-                duration_seconds
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                session_id,
-                "SESSION_FINISHED",
-                current.isoformat(),
-                session["category"],
-                active_seconds,
-            ),
+        confirm = st.text_input(
+            "Confirm Password",
+            type="password",
+            key="register_confirm",
         )
 
-    conn.commit()
-    conn.close()
+        if st.button(
+            "Create Account",
+            type="primary",
+            use_container_width=True,
+        ):
 
-    # Reset frontend session state.
-    st.session_state.focus_running = False
-    st.session_state.focus_session_id = None
-    st.session_state.focus_category = None
-    st.session_state.focus_start = None
-    st.session_state.focus_last_activity = None
-    st.session_state.focus_active_seconds = 0
-    st.session_state.focus_status = "STOPPED"
-    st.session_state.last_heartbeat = None
+            if not name.strip():
+
+                st.error(
+                    "Enter your full name."
+                )
+
+            elif "@" not in email:
+
+                st.error(
+                    "Enter a valid email address."
+                )
+
+            elif len(password) < 8:
+
+                st.error(
+                    "Password must contain at least 8 characters."
+                )
+
+            elif password != confirm:
+
+                st.error(
+                    "Passwords do not match."
+                )
+
+            else:
+
+                success, user_id = create_user(
+                    email,
+                    password,
+                    name,
+                )
+
+                if success:
+
+                    st.session_state.logged_in = True
+                    st.session_state.user_id = user_id
+
+                    st.rerun()
+
+                else:
+
+                    st.error(
+                        "An account with this email already exists."
+                    )
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+def sidebar(user):
+
+    with st.sidebar:
+
+        st.title("⚙️ GATE ME")
+
+        st.caption(
+            "GATE Mechanical Engineering"
+        )
+
+        st.divider()
+
+        st.write(
+            f"👤 **{user['full_name']}**"
+        )
+
+        st.caption(
+            user["email"]
+        )
+
+        st.divider()
+
+        page = st.radio(
+            "Navigation",
+            [
+                "🏠 Dashboard",
+                "📚 Syllabus",
+                "⏱️ Focus Mode",
+                "📝 Practice",
+                "📄 PYQs",
+                "🔄 Revision",
+                "📊 Analytics",
+                "🧠 Adaptive Engine",
+                "📝 CBT Test",
+                "🗓️ Study Planner",
+                "👤 Profile",
+            ],
+        )
+
+        st.divider()
+
+        if st.button(
+            "🚪 Logout",
+            use_container_width=True,
+        ):
+
+            if st.session_state.focus_running:
+
+                finalize_focus_session(
+                    user["id"]
+                )
+
+            for key, value in DEFAULT_STATE.items():
+
+                st.session_state[key] = value
+
+            st.rerun()
+
+    return page
 
 
 # ============================================================
 # FOCUS STATISTICS
 # ============================================================
 
-
-def get_focus_statistics(
-    user_id,
-):
+def get_focus_statistics(user_id):
 
     today = date.today()
 
@@ -1419,27 +1577,23 @@ def get_focus_statistics(
         datetime.min.time(),
     )
 
-    tomorrow_start = (
+    tomorrow = (
         today_start
         + timedelta(days=1)
     )
 
     week_start = (
         today_start
-        - timedelta(
-            days=today.weekday()
-        )
+        - timedelta(days=today.weekday())
     )
 
     conn = get_db()
 
     today_row = conn.execute(
         """
-        SELECT
-            COALESCE(
-                SUM(active_seconds),
-                0
-            ) AS seconds
+        SELECT COALESCE(
+            SUM(active_seconds), 0
+        ) AS seconds
         FROM focus_sessions
         WHERE user_id = ?
         AND start_time >= ?
@@ -1448,17 +1602,15 @@ def get_focus_statistics(
         (
             user_id,
             today_start.isoformat(),
-            tomorrow_start.isoformat(),
+            tomorrow.isoformat(),
         ),
     ).fetchone()
 
     week_row = conn.execute(
         """
-        SELECT
-            COALESCE(
-                SUM(active_seconds),
-                0
-            ) AS seconds
+        SELECT COALESCE(
+            SUM(active_seconds), 0
+        ) AS seconds
         FROM focus_sessions
         WHERE user_id = ?
         AND start_time >= ?
@@ -1467,17 +1619,15 @@ def get_focus_statistics(
         (
             user_id,
             week_start.isoformat(),
-            tomorrow_start.isoformat(),
+            tomorrow.isoformat(),
         ),
     ).fetchone()
 
     total_row = conn.execute(
         """
-        SELECT
-            COALESCE(
-                SUM(active_seconds),
-                0
-            ) AS seconds
+        SELECT COALESCE(
+            SUM(active_seconds), 0
+        ) AS seconds
         FROM focus_sessions
         WHERE user_id = ?
         """,
@@ -1486,7 +1636,7 @@ def get_focus_statistics(
         ),
     ).fetchone()
 
-    category_rows = conn.execute(
+    categories = conn.execute(
         """
         SELECT
             category,
@@ -1504,37 +1654,18 @@ def get_focus_statistics(
         ),
     ).fetchall()
 
-    recent_rows = conn.execute(
+    daily = conn.execute(
         """
         SELECT
-            category,
-            start_time,
-            end_time,
-            active_seconds,
-            duration_minutes,
-            status
-        FROM focus_sessions
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 15
-        """,
-        (
-            user_id,
-        ),
-    ).fetchall()
-
-    daily_rows = conn.execute(
-        """
-        SELECT
-            substr(start_time, 1, 10)
-                AS study_date,
+            substr(start_time,1,10)
+            AS study_date,
             COALESCE(
                 SUM(active_seconds),
                 0
             ) AS seconds
         FROM focus_sessions
         WHERE user_id = ?
-        GROUP BY substr(start_time, 1, 10)
+        GROUP BY substr(start_time,1,10)
         ORDER BY study_date DESC
         LIMIT 14
         """,
@@ -1550,16 +1681,12 @@ def get_focus_statistics(
         "week": week_row["seconds"] or 0,
         "total": total_row["seconds"] or 0,
         "categories": [
-            dict(row)
-            for row in category_rows
-        ],
-        "recent": [
-            dict(row)
-            for row in recent_rows
+            dict(x)
+            for x in categories
         ],
         "daily": [
-            dict(row)
-            for row in daily_rows
+            dict(x)
+            for x in daily
         ],
     }
 
@@ -1568,70 +1695,46 @@ def get_focus_statistics(
 # DASHBOARD
 # ============================================================
 
-
 def dashboard(user):
 
     st.title("🏠 Dashboard")
-
-    st.caption(
-        "Your personal GATE Mechanical Engineering workspace."
-    )
 
     stats = get_focus_statistics(
         user["id"]
     )
 
-    today_seconds = stats["today"]
-    week_seconds = stats["week"]
+    today = stats["today"]
 
-    daily_target_seconds = (
-        user["daily_target"] * 60
+    week = stats["week"]
+
+    daily_target = (
+        user["daily_target"]
+        * 60
     )
 
-    weekly_target_seconds = (
-        user["weekly_target"] * 60
+    weekly_target = (
+        user["weekly_target"]
+        * 60
     )
 
-    daily_percentage = min(
-        1.0,
-        today_seconds
-        / max(
-            1,
-            daily_target_seconds,
-        ),
-    )
+    c1, c2, c3, c4 = st.columns(4)
 
-    weekly_percentage = min(
-        1.0,
-        week_seconds
-        / max(
-            1,
-            weekly_target_seconds,
-        ),
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
+    c1.metric(
         "Today's Focus",
-        format_duration(
-            today_seconds
-        ),
+        format_duration(today),
     )
 
-    col2.metric(
+    c2.metric(
         "Weekly Focus",
-        format_duration(
-            week_seconds
-        ),
+        format_duration(week),
     )
 
-    col3.metric(
+    c3.metric(
         "Daily Target",
         f"{user['daily_target']} min",
     )
 
-    col4.metric(
+    c4.metric(
         "Weekly Target",
         f"{user['weekly_target']} min",
     )
@@ -1639,188 +1742,81 @@ def dashboard(user):
     st.divider()
 
     st.subheader(
-        "🎯 Today's Target"
+        "🎯 Daily Target"
     )
 
-    st.progress(
-        daily_percentage,
-        text=(
-            f"{today_seconds // 60} / "
-            f"{user['daily_target']} minutes"
+    daily_ratio = min(
+        1.0,
+        today / max(
+            1,
+            daily_target,
         ),
     )
 
-    if today_seconds >= daily_target_seconds:
-
-        st.success(
-            "Daily study target completed."
-        )
-
-    else:
-
-        remaining = (
-            daily_target_seconds
-            - today_seconds
-        )
-
-        st.info(
-            f"{remaining // 60} minutes remaining "
-            "for today's target."
-        )
+    st.progress(
+        daily_ratio,
+        text=(
+            f"{today // 60} / "
+            f"{user['daily_target']} minutes"
+        ),
+    )
 
     st.subheader(
         "📅 Weekly Target"
     )
 
+    weekly_ratio = min(
+        1.0,
+        week / max(
+            1,
+            weekly_target,
+        ),
+    )
+
     st.progress(
-        weekly_percentage,
+        weekly_ratio,
         text=(
-            f"{week_seconds // 60} / "
+            f"{week // 60} / "
             f"{user['weekly_target']} minutes"
         ),
     )
 
-    remaining_week = max(
-        0,
-        weekly_target_seconds
-        - week_seconds,
-    )
-
-    st.caption(
-        f"{remaining_week // 60} minutes remaining "
-        "for this week's target."
-    )
-
     st.divider()
 
     st.subheader(
-        "📊 Study Categories"
+        "🧠 Adaptive Learning Status"
     )
 
-    category_columns = st.columns(
-        len(FOCUS_CATEGORIES)
+    mastery = get_mastery_statistics(
+        user["id"]
     )
 
-    category_map = {
-        item["category"]: item["seconds"]
-        for item in stats["categories"]
-    }
+    a, b, c = st.columns(3)
 
-    for index, category in enumerate(
-        FOCUS_CATEGORIES
-    ):
-
-        with category_columns[index]:
-
-            seconds = category_map.get(
-                category,
-                0,
-            )
-
-            st.metric(
-                category.replace(
-                    "_",
-                    " ",
-                ),
-                format_duration(seconds),
-            )
-
-    st.divider()
-
-    st.subheader(
-        "🧠 Learning Workspace"
+    a.metric(
+        "Topics Attempted",
+        mastery["attempted"],
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-
-        st.info(
-            "### 📚 Learn\n\n"
-            "Build concepts step by step."
-        )
-
-    with c2:
-
-        st.info(
-            "### 📝 Practice\n\n"
-            "Solve engineering problems."
-        )
-
-    with c3:
-
-        st.info(
-            "### 📄 PYQs\n\n"
-            "Apply concepts to GATE questions."
-        )
-
-    with c4:
-
-        st.info(
-            "### 🔄 Revision\n\n"
-            "Review concepts that need attention."
-        )
-
-    st.divider()
-
-    st.subheader(
-        "📈 Recent Study Activity"
+    b.metric(
+        "Strong Topics",
+        mastery["strong"],
     )
 
-    if stats["recent"]:
-
-        display_rows = []
-
-        for row in stats["recent"]:
-
-            display_rows.append(
-                {
-                    "Category": row[
-                        "category"
-                    ].replace(
-                        "_",
-                        " ",
-                    ),
-                    "Start": row[
-                        "start_time"
-                    ],
-                    "Duration": format_duration(
-                        row[
-                            "active_seconds"
-                        ]
-                    ),
-                    "Status": row[
-                        "status"
-                    ],
-                }
-            )
-
-        st.dataframe(
-            display_rows,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    else:
-
-        st.caption(
-            "No study sessions recorded yet."
-        )
+    c.metric(
+        "Weak Topics",
+        mastery["weak"],
+    )
 
 
 # ============================================================
-# SYLLABUS PAGE
+# SYLLABUS
 # ============================================================
-
 
 def syllabus_page():
 
     st.title(
         "📚 GATE Mechanical Engineering Syllabus"
-    )
-
-    st.write(
-        "Select a subject to explore its topics."
     )
 
     for subject, topics in SYLLABUS.items():
@@ -1834,9 +1830,10 @@ def syllabus_page():
                 st.checkbox(
                     topic,
                     key=(
-                        f"syllabus_"
-                        f"{subject}_"
-                        f"{topic}"
+                        "syllabus_"
+                        + subject
+                        + "_"
+                        + topic
                     ),
                 )
 
@@ -1845,40 +1842,53 @@ def syllabus_page():
 # FOCUS MODE
 # ============================================================
 
-
 def focus_mode(user):
 
     st.title("⏱️ Focus Mode")
 
-    st.caption(
-        "Phase 3 Study Intelligence — "
-        "verified active study tracking."
-    )
+    if not st.session_state.focus_running:
 
-    # --------------------------------------------------------
-    # ACTIVE SESSION
-    # --------------------------------------------------------
+        category = st.selectbox(
+            "Study Category",
+            FOCUS_CATEGORIES,
+        )
 
-    if st.session_state.focus_running:
+        st.info(
+            "Start a session when you are ready to study."
+        )
+
+        if st.button(
+            "▶ START FOCUS SESSION",
+            type="primary",
+            use_container_width=True,
+        ):
+
+            session_id = create_focus_session(
+                user["id"],
+                category,
+            )
+
+            current = now()
+
+            st.session_state.focus_running = True
+            st.session_state.focus_session_id = session_id
+            st.session_state.focus_category = category
+            st.session_state.focus_start = current
+            st.session_state.focus_last_activity = current
+            st.session_state.focus_status = "ACTIVE"
+
+            st.rerun()
+
+    else:
 
         session_id = (
             st.session_state.focus_session_id
         )
 
-        result = update_focus_heartbeat(
+        check_focus_inactivity(
             user["id"],
             session_id,
         )
-
-        if result == "INACTIVE":
-
-            st.session_state.focus_status = (
-                "PAUSED_INACTIVE"
-            )
-
-        # ----------------------------------------------------
-        # GET CURRENT SESSION
-        # ----------------------------------------------------
 
         conn = get_db()
 
@@ -1900,6 +1910,7 @@ def focus_mode(user):
         if not session:
 
             st.session_state.focus_running = False
+
             st.rerun()
 
         status = session["status"]
@@ -1909,95 +1920,30 @@ def focus_mode(user):
             or 0
         )
 
-        st.subheader(
-            "Current Focus Session"
+        st.metric(
+            "Verified Active Time",
+            format_duration(
+                active_seconds
+            ),
         )
 
-        c1, c2, c3 = st.columns(3)
+        st.metric(
+            "Status",
+            status.replace(
+                "_",
+                " ",
+            ),
+        )
 
-        with c1:
-
-            st.metric(
-                "Category",
-                session["category"].replace(
-                    "_",
-                    " ",
-                ),
-            )
-
-        with c2:
-
-            st.metric(
-                "Verified Active Time",
-                format_duration(
-                    active_seconds
-                ),
-            )
-
-        with c3:
-
-            st.metric(
-                "Session Status",
-                status.replace(
-                    "_",
-                    " ",
-                ),
-            )
-
-        # ----------------------------------------------------
-        # INACTIVE
-        # ----------------------------------------------------
-
-        if status == "PAUSED_INACTIVE":
-
-            st.error(
-                "⏸️ Session automatically paused "
-                "because no activity was confirmed "
-                "for more than 5 minutes."
-            )
-
-            st.write(
-                "Resume only when you are ready to continue studying."
-            )
-
-            if st.button(
-                "▶ RESUME STUDY",
-                type="primary",
-                use_container_width=True,
-            ):
-
-                resume_focus_session(
-                    user["id"],
-                    session_id,
-                )
-
-                st.session_state.focus_status = (
-                    "ACTIVE"
-                )
-
-                st.success(
-                    "Focus session resumed."
-                )
-
-                st.rerun()
-
-        # ----------------------------------------------------
-        # ACTIVE
-        # ----------------------------------------------------
-
-        elif status == "ACTIVE":
+        if status == "ACTIVE":
 
             st.success(
                 "🟢 FOCUS SESSION ACTIVE"
             )
 
-            st.warning(
-                "The application does not treat an "
-                "open browser tab as proof of studying."
-            )
-
             st.write(
-                "Use the confirmation below while you are actively studying."
+                "Confirm your activity periodically "
+                "to keep the session active."
             )
 
             if st.button(
@@ -2011,294 +1957,332 @@ def focus_mode(user):
                     session_id,
                 )
 
-                st.success(
-                    "Activity confirmed."
+                st.rerun()
+
+            if st.button(
+                "⏸ PAUSE SESSION",
+                use_container_width=True,
+            ):
+
+                pause_focus_session(
+                    user["id"],
+                    session_id,
                 )
 
                 st.rerun()
 
-        # ----------------------------------------------------
-        # CONTROLS
-        # ----------------------------------------------------
+        elif status == "PAUSED_INACTIVE":
 
-        st.divider()
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-
-            if status == "ACTIVE":
-
-                if st.button(
-                    "⏸ PAUSE SESSION",
-                    use_container_width=True,
-                ):
-
-                    pause_focus_session(
-                        user["id"],
-                        session_id,
-                    )
-
-                    st.rerun()
-
-            else:
-
-                if st.button(
-                    "▶ RESUME SESSION",
-                    use_container_width=True,
-                ):
-
-                    resume_focus_session(
-                        user["id"],
-                        session_id,
-                    )
-
-                    st.rerun()
-
-        with c2:
+            st.warning(
+                "⏸ Session automatically paused "
+                "after more than 5 minutes without "
+                "confirmed activity."
+            )
 
             if st.button(
-                "■ STOP & SAVE SESSION",
+                "▶ RESUME",
                 type="primary",
                 use_container_width=True,
             ):
 
-                final_seconds = (
-                    active_seconds
-                )
-
-                finalize_focus_session(
+                resume_focus_session(
                     user["id"],
-                    reason="STOPPED",
-                )
-
-                st.success(
-                    "Focus session saved: "
-                    + format_duration(
-                        final_seconds
-                    )
+                    session_id,
                 )
 
                 st.rerun()
 
-        # ----------------------------------------------------
-        # 30-SECOND HEARTBEAT INFORMATION
-        # ----------------------------------------------------
+        else:
+
+            if st.button(
+                "▶ RESUME",
+                use_container_width=True,
+            ):
+
+                resume_focus_session(
+                    user["id"],
+                    session_id,
+                )
+
+                st.rerun()
 
         st.divider()
 
-        st.caption(
-            "System heartbeat: approximately every "
-            f"{HEARTBEAT_SECONDS} seconds."
-        )
-
-        st.caption(
-            "Inactivity timeout: "
-            f"{SESSION_TIMEOUT_SECONDS // 60} minutes."
-        )
-
-        # Streamlit fragment automatically reruns
-        # this section periodically on supported versions.
-        try:
-
-            @st.fragment(
-                run_every=f"{HEARTBEAT_SECONDS}s"
-            )
-            def live_status():
-
-                if (
-                    st.session_state.focus_running
-                ):
-
-                    st.caption(
-                        f"Last system check: "
-                        f"{datetime.now().strftime('%H:%M:%S')}"
-                    )
-
-            live_status()
-
-        except Exception:
-
-            st.caption(
-                "Live heartbeat refresh will be "
-                "available with the current Streamlit version."
-            )
-
-    # --------------------------------------------------------
-    # NO ACTIVE SESSION
-    # --------------------------------------------------------
-
-    else:
-
-        st.info(
-            "No focus session is currently running."
-        )
-
-        category = st.selectbox(
-            "Study Category",
-            FOCUS_CATEGORIES,
-        )
-
-        st.write(
-            "Choose what you are studying before starting."
-        )
-
         if st.button(
-            "▶ START FOCUS SESSION",
+            "■ STOP & SAVE SESSION",
             type="primary",
             use_container_width=True,
         ):
 
-            session_id = create_focus_session(
-                user["id"],
-                category,
-            )
-
-            current = now()
-
-            st.session_state.focus_running = True
-            st.session_state.focus_session_id = (
-                session_id
-            )
-            st.session_state.focus_category = (
-                category
-            )
-            st.session_state.focus_start = current
-            st.session_state.focus_last_activity = (
-                current
-            )
-            st.session_state.focus_active_seconds = (
-                0
-            )
-            st.session_state.focus_status = (
-                "ACTIVE"
-            )
-            st.session_state.last_heartbeat = (
-                current
+            finalize_focus_session(
+                user["id"]
             )
 
             st.success(
-                "Focus session started."
+                "Focus session saved."
             )
 
             st.rerun()
 
-    # --------------------------------------------------------
-    # RECENT SESSIONS
-    # --------------------------------------------------------
 
-    st.divider()
+# ============================================================
+# QUESTION FUNCTIONS
+# ============================================================
 
-    st.subheader(
-        "📋 Recent Focus Sessions"
-    )
+def get_questions(
+    subject=None,
+    topic=None,
+    question_type=None,
+    user_id=None,
+    limit=10,
+):
 
     conn = get_db()
 
-    sessions = conn.execute(
+    query = """
+        SELECT *
+        FROM questions
+        WHERE 1 = 1
+    """
+
+    params = []
+
+    if subject:
+
+        query += """
+            AND subject = ?
         """
-        SELECT
-            category,
-            start_time,
-            end_time,
-            active_seconds,
-            status
-        FROM focus_sessions
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 15
-        """,
-        (
-            user["id"],
-        ),
+
+        params.append(subject)
+
+    if topic:
+
+        query += """
+            AND topic = ?
+        """
+
+        params.append(topic)
+
+    if question_type:
+
+        query += """
+            AND question_type = ?
+        """
+
+        params.append(question_type)
+
+    if user_id:
+
+        query += """
+            AND id NOT IN (
+                SELECT question_id
+                FROM question_responses
+                WHERE user_id = ?
+                ORDER BY attempted_at DESC
+                LIMIT 5
+            )
+        """
+
+        params.append(user_id)
+
+    query += """
+        ORDER BY RANDOM()
+        LIMIT ?
+    """
+
+    params.append(limit)
+
+    rows = conn.execute(
+        query,
+        params,
     ).fetchall()
 
     conn.close()
 
-    if sessions:
+    return [
+        dict(row)
+        for row in rows
+    ]
 
-        rows = []
 
-        for session in sessions:
+def save_question_response(
+    user_id,
+    question_id,
+    selected_answer,
+    response_time,
+):
 
-            rows.append(
-                {
-                    "Category": session[
-                        "category"
-                    ].replace(
-                        "_",
-                        " ",
-                    ),
-                    "Start": session[
-                        "start_time"
-                    ],
-                    "End": session[
-                        "end_time"
-                    ]
-                    or "-",
-                    "Active Time": format_duration(
-                        session[
-                            "active_seconds"
-                        ]
-                        or 0
-                    ),
-                    "Status": session[
-                        "status"
-                    ],
-                }
-            )
+    conn = get_db()
 
-        st.dataframe(
-            rows,
-            use_container_width=True,
-            hide_index=True,
+    question = conn.execute(
+        """
+        SELECT *
+        FROM questions
+        WHERE id = ?
+        """,
+        (
+            question_id,
+        ),
+    ).fetchone()
+
+    if not question:
+
+        conn.close()
+
+        return False
+
+    correct = (
+        selected_answer.strip().upper()
+        == question["correct_answer"]
+        .strip()
+        .upper()
+    )
+
+    conn.execute(
+        """
+        INSERT INTO question_responses
+        (
+            user_id,
+            question_id,
+            selected_answer,
+            is_correct,
+            response_time_seconds,
+            attempted_at
         )
-
-    else:
-
-        st.caption(
-            "No completed focus sessions yet."
-        )
-
-
-# ============================================================
-# PRACTICE
-# ============================================================
-
-
-def practice_page():
-
-    st.title("📝 Practice")
-
-    st.info(
-        "Practice engine foundation. "
-        "Question evaluation will be expanded in Phase 4."
-    )
-
-    subject = st.selectbox(
-        "Subject",
-        list(SYLLABUS.keys()),
-    )
-
-    topic = st.selectbox(
-        "Topic",
-        SYLLABUS[subject],
-    )
-
-    notes = st.text_area(
-        "Practice notes",
-        placeholder=(
-            "Write your solution, "
-            "formula, mistake or doubt here..."
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            question_id,
+            selected_answer,
+            1 if correct else 0,
+            response_time,
+            now().isoformat(),
         ),
     )
 
-    if st.button(
-        "Save Practice Session",
-        use_container_width=True,
-    ):
+    conn.commit()
 
-        conn = get_db()
+    conn.close()
+
+    update_topic_mastery(
+        user_id,
+        question["subject"],
+        question["topic"],
+    )
+
+    return correct
+
+
+# ============================================================
+# TOPIC MASTERY
+# ============================================================
+
+def update_topic_mastery(
+    user_id,
+    subject,
+    topic,
+):
+
+    conn = get_db()
+
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS attempts,
+            COALESCE(
+                SUM(is_correct),
+                0
+            ) AS correct
+        FROM question_responses qr
+        JOIN questions q
+            ON qr.question_id = q.id
+        WHERE qr.user_id = ?
+        AND q.subject = ?
+        AND q.topic = ?
+        """,
+        (
+            user_id,
+            subject,
+            topic,
+        ),
+    ).fetchone()
+
+    attempts = row["attempts"]
+
+    correct = row["correct"]
+
+    accuracy = (
+        correct / attempts * 100
+        if attempts
+        else 0
+    )
+
+    if attempts == 0:
+
+        status = "NOT_STARTED"
+        weakness = 0
+
+    elif accuracy >= MASTERY_THRESHOLD:
+
+        status = "STRONG"
+        weakness = 0
+
+    elif accuracy >= 70:
+
+        status = "NEEDS_REVISION"
+        weakness = 50
+
+    else:
+
+        status = "WEAK"
+        weakness = 100 - accuracy
+
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM study_progress
+        WHERE user_id = ?
+        AND subject = ?
+        AND topic = ?
+        """,
+        (
+            user_id,
+            subject,
+            topic,
+        ),
+    ).fetchone()
+
+    if existing:
+
+        conn.execute(
+            """
+            UPDATE study_progress
+            SET
+                status = ?,
+                mastery_status = ?,
+                accuracy = ?,
+                attempts = ?,
+                correct = ?,
+                weakness_score = ?,
+                last_attempt_at = ?
+            WHERE id = ?
+            AND user_id = ?
+            """,
+            (
+                status,
+                status,
+                accuracy,
+                attempts,
+                correct,
+                weakness,
+                now().isoformat(),
+                existing["id"],
+                user_id,
+            ),
+        )
+
+    else:
 
         conn.execute(
             """
@@ -2308,86 +2292,387 @@ def practice_page():
                 subject,
                 topic,
                 status,
-                attempts
+                mastery_status,
+                accuracy,
+                attempts,
+                correct,
+                weakness_score,
+                last_attempt_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                st.session_state.user_id,
+                user_id,
                 subject,
                 topic,
-                "IN_PROGRESS",
-                1,
+                status,
+                status,
+                accuracy,
+                attempts,
+                correct,
+                weakness,
+                now().isoformat(),
             ),
         )
 
-        conn.commit()
-        conn.close()
+    conn.commit()
 
-        st.success(
-            "Practice activity recorded."
+    conn.close()
+
+    update_revision_queue(
+        user_id,
+        subject,
+        topic,
+        accuracy,
+    )
+
+
+# ============================================================
+# REVISION QUEUE GENERATION
+# ============================================================
+
+def update_revision_queue(
+    user_id,
+    subject,
+    topic,
+    accuracy,
+):
+
+    conn = get_db()
+
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM revision_queue
+        WHERE user_id = ?
+        AND subject = ?
+        AND topic = ?
+        AND status = 'PENDING'
+        """,
+        (
+            user_id,
+            subject,
+            topic,
+        ),
+    ).fetchone()
+
+    if accuracy < MASTERY_THRESHOLD:
+
+        if accuracy < 50:
+
+            priority = 5
+
+            days = 1
+
+        elif accuracy < 70:
+
+            priority = 4
+
+            days = 2
+
+        else:
+
+            priority = 3
+
+            days = 4
+
+        next_revision = (
+            date.today()
+            + timedelta(days=days)
+        ).isoformat()
+
+        if existing:
+
+            conn.execute(
+                """
+                UPDATE revision_queue
+                SET
+                    priority = ?,
+                    next_revision = ?
+                WHERE id = ?
+                AND user_id = ?
+                """,
+                (
+                    priority,
+                    next_revision,
+                    existing["id"],
+                    user_id,
+                ),
+            )
+
+        else:
+
+            conn.execute(
+                """
+                INSERT INTO revision_queue
+                (
+                    user_id,
+                    subject,
+                    topic,
+                    priority,
+                    next_revision,
+                    status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
+                """,
+                (
+                    user_id,
+                    subject,
+                    topic,
+                    priority,
+                    next_revision,
+                    now().isoformat(),
+                ),
+            )
+
+    else:
+
+        conn.execute(
+            """
+            UPDATE revision_queue
+            SET status = 'MASTERED'
+            WHERE user_id = ?
+            AND subject = ?
+            AND topic = ?
+            AND status = 'PENDING'
+            """,
+            (
+                user_id,
+                subject,
+                topic,
+            ),
         )
 
+    conn.commit()
+
+    conn.close()
+
+
+def get_mastery_statistics(user_id):
+
+    conn = get_db()
+
+    attempted = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM study_progress
+        WHERE user_id = ?
+        AND attempts > 0
+        """,
+        (
+            user_id,
+        ),
+    ).fetchone()[0]
+
+    strong = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM study_progress
+        WHERE user_id = ?
+        AND mastery_status = 'STRONG'
+        """,
+        (
+            user_id,
+        ),
+    ).fetchone()[0]
+
+    weak = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM study_progress
+        WHERE user_id = ?
+        AND mastery_status IN
+        ('WEAK', 'NEEDS_REVISION')
+        """,
+        (
+            user_id,
+        ),
+    ).fetchone()[0]
+
+    conn.close()
+
+    return {
+        "attempted": attempted,
+        "strong": strong,
+        "weak": weak,
+    }
+
 
 # ============================================================
-# PYQ
+# PRACTICE PAGE
 # ============================================================
 
+def practice_page(user):
 
-def pyq_page():
+    st.title("📝 Adaptive Practice")
 
-    st.title(
-        "📄 GATE Previous Year Questions"
+    subjects = list(SYLLABUS.keys())
+
+    subject = st.selectbox(
+        "Subject",
+        subjects,
     )
 
-    st.info(
-        "PYQ/CBT engine will be expanded with "
-        "MCQ, MSQ and NAT evaluation."
+    topic = st.selectbox(
+        "Topic",
+        SYLLABUS[subject],
     )
 
-    st.selectbox(
-        "Select Subject",
-        list(SYLLABUS.keys()),
-    )
-
-    st.selectbox(
+    question_type = st.selectbox(
         "Question Type",
-        [
-            "MCQ",
-            "MSQ",
-            "NAT",
-        ],
+        QUESTION_TYPES,
     )
 
     if st.button(
-        "Start PYQ Session",
+        "🎯 Find Adaptive Questions",
         type="primary",
         use_container_width=True,
     ):
 
-        st.info(
-            "PYQ session framework initialized."
+        questions = get_questions(
+            subject=subject,
+            topic=topic,
+            question_type="MCQ",
+            user_id=user["id"],
+            limit=5,
         )
 
+        if questions:
 
-# ============================================================
-# REVISION
-# ============================================================
+            st.session_state.practice_questions = questions
 
+            st.session_state.practice_index = 0
 
-def revision_page():
+            st.session_state.practice_started = datetime.now()
 
-    st.title("🔄 Revision")
+            st.rerun()
+
+        else:
+
+            st.warning(
+                "No questions are currently available "
+                "for this exact subject/topic/type."
+            )
+
+    if (
+        "practice_questions"
+        not in st.session_state
+    ):
+
+        st.info(
+            "Select a topic and start an adaptive practice set."
+        )
+
+        return
+
+    questions = st.session_state.practice_questions
+
+    index = st.session_state.practice_index
+
+    if index >= len(questions):
+
+        st.success(
+            "Practice set completed."
+        )
+
+        del st.session_state.practice_questions
+
+        return
+
+    question = questions[index]
+
+    st.divider()
 
     st.caption(
-        "Phase 3 revision scheduling foundation."
+        f"Question {index + 1} of {len(questions)}"
     )
 
-    user_id = st.session_state.user_id
+    st.subheader(
+        question["question_text"]
+    )
+
+    options = {
+        "A": question["option_a"],
+        "B": question["option_b"],
+        "C": question["option_c"],
+        "D": question["option_d"],
+    }
+
+    selected = st.radio(
+        "Select your answer",
+        [
+            f"A — {options['A']}",
+            f"B — {options['B']}",
+            f"C — {options['C']}",
+            f"D — {options['D']}",
+        ],
+    )
+
+    if st.button(
+        "Submit Answer",
+        type="primary",
+        use_container_width=True,
+    ):
+
+        answer = selected[0]
+
+        started = st.session_state.get(
+            "practice_started",
+            datetime.now(),
+        )
+
+        response_time = int(
+            (
+                datetime.now()
+                - started
+            ).total_seconds()
+        )
+
+        correct = save_question_response(
+            user["id"],
+            question["id"],
+            answer,
+            response_time,
+        )
+
+        if correct:
+
+            st.success(
+                "✅ Correct answer."
+            )
+
+        else:
+
+            st.error(
+                "❌ Incorrect answer."
+            )
+
+        st.info(
+            "Explanation: "
+            + question["explanation"]
+        )
+
+        st.session_state.practice_index += 1
+
+        st.session_state.practice_started = (
+            datetime.now()
+        )
+
+        st.rerun()
+
+
+# ============================================================
+# REVISION PAGE
+# ============================================================
+
+def revision_page(user):
+
+    st.title("🔄 Revision Engine")
 
     conn = get_db()
 
-    revisions = conn.execute(
+    rows = conn.execute(
         """
         SELECT
             subject,
@@ -2397,65 +2682,542 @@ def revision_page():
             status
         FROM revision_queue
         WHERE user_id = ?
+        AND status = 'PENDING'
         ORDER BY
             priority DESC,
             next_revision ASC
         """,
         (
-            user_id,
+            user["id"],
         ),
     ).fetchall()
 
     conn.close()
 
-    if revisions:
+    if not rows:
 
-        rows = []
+        st.success(
+            "No pending weak-topic revisions."
+        )
 
-        for item in revisions:
+        return
 
-            rows.append(
-                {
-                    "Subject": item[
-                        "subject"
-                    ],
-                    "Topic": item[
-                        "topic"
-                    ],
-                    "Priority": item[
-                        "priority"
-                    ],
-                    "Next Revision": item[
-                        "next_revision"
-                    ],
-                    "Status": item[
-                        "status"
-                    ],
-                }
+    data = []
+
+    for row in rows:
+
+        data.append(
+            {
+                "Subject": row["subject"],
+                "Topic": row["topic"],
+                "Priority": row["priority"],
+                "Next Revision": row["next_revision"],
+                "Status": row["status"],
+            }
+        )
+
+    st.dataframe(
+        data,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption(
+        "Priority is generated from observed topic performance."
+    )
+
+
+# ============================================================
+# ADAPTIVE ENGINE
+# ============================================================
+
+def adaptive_engine_page(user):
+
+    st.title("🧠 Adaptive GATE Engine")
+
+    st.caption(
+        "The system uses your actual question performance "
+        "to identify topics requiring additional work."
+    )
+
+    conn = get_db()
+
+    rows = conn.execute(
+        """
+        SELECT
+            subject,
+            topic,
+            accuracy,
+            attempts,
+            correct,
+            mastery_status,
+            weakness_score,
+            last_attempt_at
+        FROM study_progress
+        WHERE user_id = ?
+        AND attempts > 0
+        ORDER BY weakness_score DESC
+        """,
+        (
+            user["id"],
+        ),
+    ).fetchall()
+
+    conn.close()
+
+    if not rows:
+
+        st.info(
+            "Complete some practice questions first. "
+            "The adaptive engine will then calculate "
+            "topic performance."
+        )
+
+        return
+
+    st.subheader(
+        "📊 Topic Mastery"
+    )
+
+    data = []
+
+    for row in rows:
+
+        data.append(
+            {
+                "Subject": row["subject"],
+                "Topic": row["topic"],
+                "Attempts": row["attempts"],
+                "Correct": row["correct"],
+                "Accuracy (%)": round(
+                    row["accuracy"],
+                    1,
+                ),
+                "Mastery": row[
+                    "mastery_status"
+                ],
+                "Weakness": round(
+                    row["weakness_score"],
+                    1,
+                ),
+            }
+        )
+
+    st.dataframe(
+        data,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.divider()
+
+    st.subheader(
+        "🎯 Recommended Next Topics"
+    )
+
+    weak_rows = sorted(
+        data,
+        key=lambda x: x["Weakness"],
+        reverse=True,
+    )
+
+    for item in weak_rows[:5]:
+
+        if item["Weakness"] > 0:
+
+            st.warning(
+                f"**{item['Subject']} → "
+                f"{item['Topic']}** — "
+                f"{item['Accuracy (%)']}% accuracy"
             )
 
-        st.dataframe(
-            rows,
+
+# ============================================================
+# PYQ PAGE
+# ============================================================
+
+def pyq_page():
+
+    st.title(
+        "📄 GATE Previous Year Questions"
+    )
+
+    st.info(
+        "PYQ infrastructure is separated from the original "
+        "practice-question bank. Official PYQs should be "
+        "loaded from a properly sourced/licensed dataset."
+    )
+
+    st.selectbox(
+        "Select Subject",
+        list(SYLLABUS.keys()),
+    )
+
+    st.selectbox(
+        "Question Type",
+        QUESTION_TYPES,
+    )
+
+
+# ============================================================
+# CBT ENGINE
+# ============================================================
+
+def create_cbt_session(
+    user_id,
+    question_count,
+):
+
+    questions = get_questions(
+        user_id=user_id,
+        limit=question_count,
+    )
+
+    if not questions:
+
+        return None
+
+    conn = get_db()
+
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO cbt_sessions
+        (
+            user_id,
+            session_type,
+            started_at,
+            total_questions,
+            status
+        )
+        VALUES (?, ?, ?, ?, 'ACTIVE')
+        """,
+        (
+            user_id,
+            "ADAPTIVE_CBT",
+            now().isoformat(),
+            len(questions),
+        ),
+    )
+
+    session_id = cur.lastrowid
+
+    for index, question in enumerate(
+        questions
+    ):
+
+        conn.execute(
+            """
+            INSERT INTO cbt_session_questions
+            (
+                cbt_session_id,
+                question_id,
+                question_order
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                session_id,
+                question["id"],
+                index,
+            ),
+        )
+
+    conn.commit()
+
+    conn.close()
+
+    return session_id
+
+
+def cbt_page(user):
+
+    st.title("📝 CBT Test")
+
+    if not st.session_state.cbt_session_id:
+
+        st.write(
+            "Adaptive CBT-style test using the available "
+            "original GATE-style question bank."
+        )
+
+        question_count = st.selectbox(
+            "Number of Questions",
+            [5, 10],
+        )
+
+        if st.button(
+            "▶ START CBT",
+            type="primary",
             use_container_width=True,
-            hide_index=True,
+        ):
+
+            session_id = create_cbt_session(
+                user["id"],
+                question_count,
+            )
+
+            if session_id:
+
+                st.session_state.cbt_session_id = (
+                    session_id
+                )
+
+                st.session_state.cbt_question_index = (
+                    0
+                )
+
+                st.session_state.cbt_started = (
+                    datetime.now()
+                )
+
+                st.rerun()
+
+            else:
+
+                st.error(
+                    "Not enough questions available."
+                )
+
+        return
+
+    session_id = (
+        st.session_state.cbt_session_id
+    )
+
+    conn = get_db()
+
+    rows = conn.execute(
+        """
+        SELECT
+            csq.id,
+            csq.question_order,
+            csq.selected_answer,
+            csq.answered,
+            q.*
+        FROM cbt_session_questions csq
+        JOIN questions q
+            ON csq.question_id = q.id
+        WHERE csq.cbt_session_id = ?
+        ORDER BY csq.question_order
+        """,
+        (
+            session_id,
+        ),
+    ).fetchall()
+
+    conn.close()
+
+    index = (
+        st.session_state.cbt_question_index
+    )
+
+    if index >= len(rows):
+
+        finish_cbt(
+            user["id"],
+            session_id,
+        )
+
+        return
+
+    question = dict(
+        rows[index]
+    )
+
+    st.caption(
+        f"Question {index + 1} / {len(rows)}"
+    )
+
+    st.progress(
+        (index + 1) / len(rows)
+    )
+
+    st.subheader(
+        question["question_text"]
+    )
+
+    options = {
+        "A": question["option_a"],
+        "B": question["option_b"],
+        "C": question["option_c"],
+        "D": question["option_d"],
+    }
+
+    selected = st.radio(
+        "Answer",
+        [
+            f"A — {options['A']}",
+            f"B — {options['B']}",
+            f"C — {options['C']}",
+            f"D — {options['D']}",
+        ],
+        key=f"cbt_{session_id}_{index}",
+    )
+
+    if st.button(
+        "Submit & Next",
+        type="primary",
+        use_container_width=True,
+    ):
+
+        answer = selected[0]
+
+        correct = (
+            answer
+            == question["correct_answer"]
+        )
+
+        conn = get_db()
+
+        conn.execute(
+            """
+            UPDATE cbt_session_questions
+            SET
+                selected_answer = ?,
+                is_correct = ?,
+                answered = 1
+            WHERE id = ?
+            """,
+            (
+                answer,
+                1 if correct else 0,
+                question["id"],
+            ),
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        save_question_response(
+            user["id"],
+            question["id"],
+            answer,
+            0,
+        )
+
+        st.session_state.cbt_question_index += 1
+
+        st.rerun()
+
+
+def finish_cbt(
+    user_id,
+    session_id,
+):
+
+    conn = get_db()
+
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            SUM(answered) AS attempted,
+            SUM(
+                CASE
+                    WHEN is_correct = 1
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS correct
+        FROM cbt_session_questions
+        WHERE cbt_session_id = ?
+        """,
+        (
+            session_id,
+        ),
+    ).fetchone()
+
+    total = row["total"] or 0
+
+    attempted = row["attempted"] or 0
+
+    correct = row["correct"] or 0
+
+    score = (
+        correct / total * 100
+        if total
+        else 0
+    )
+
+    conn.execute(
+        """
+        UPDATE cbt_sessions
+        SET
+            completed_at = ?,
+            attempted_questions = ?,
+            correct_questions = ?,
+            score = ?,
+            status = 'COMPLETED'
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            now().isoformat(),
+            attempted,
+            correct,
+            score,
+            session_id,
+            user_id,
+        ),
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    st.success(
+        "🎉 CBT completed."
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Questions",
+        total,
+    )
+
+    c2.metric(
+        "Correct",
+        correct,
+    )
+
+    c3.metric(
+        "Score",
+        f"{score:.1f}%",
+    )
+
+    if score >= MASTERY_THRESHOLD:
+
+        st.success(
+            "Performance reached the current "
+            "mastery threshold."
         )
 
     else:
 
-        st.info(
-            "No revision items have been generated yet."
+        st.warning(
+            "Topics associated with incorrect answers "
+            "will remain candidates for revision."
         )
 
-        st.write(
-            "The adaptive weakness/retest engine will "
-            "populate this queue in Phase 4."
-        )
+    if st.button(
+        "Start New CBT",
+        use_container_width=True,
+    ):
+
+        st.session_state.cbt_session_id = None
+
+        st.session_state.cbt_question_index = 0
+
+        st.rerun()
 
 
 # ============================================================
 # ANALYTICS
 # ============================================================
-
 
 def analytics_page(user):
 
@@ -2465,189 +3227,230 @@ def analytics_page(user):
         user["id"]
     )
 
-    # --------------------------------------------------------
-    # TOP METRICS
-    # --------------------------------------------------------
+    c1, c2, c3 = st.columns(3)
 
-    col1, col2, col3 = st.columns(3)
+    c1.metric(
+        "Today",
+        format_duration(
+            stats["today"]
+        ),
+    )
 
-    with col1:
+    c2.metric(
+        "This Week",
+        format_duration(
+            stats["week"]
+        ),
+    )
 
-        st.metric(
-            "Today",
-            format_duration(
-                stats["today"]
-            ),
-        )
-
-    with col2:
-
-        st.metric(
-            "This Week",
-            format_duration(
-                stats["week"]
-            ),
-        )
-
-    with col3:
-
-        st.metric(
-            "Lifetime",
-            format_duration(
-                stats["total"]
-            ),
-        )
+    c3.metric(
+        "Lifetime",
+        format_duration(
+            stats["total"]
+        ),
+    )
 
     st.divider()
 
     # --------------------------------------------------------
-    # CATEGORY ANALYSIS
+    # CATEGORY TABLE
     # --------------------------------------------------------
 
     st.subheader(
-        "📚 Time by Study Category"
+        "📚 Study Time by Category"
     )
 
     if stats["categories"]:
 
-        category_data = []
+        category_rows = []
 
-        for row in stats["categories"]:
+        for item in stats["categories"]:
 
-            category_data.append(
+            category_rows.append(
                 {
-                    "Category": row[
-                        "category"
-                    ].replace(
-                        "_",
-                        " ",
-                    ),
-                    "Minutes": round(
-                        row["seconds"]
-                        / 60,
-                        1,
-                    ),
+                    "Study Category":
+                        item["category"]
+                        .replace(
+                            "_",
+                            " ",
+                        ),
+                    "Time (minutes)":
+                        round(
+                            item["seconds"]
+                            / 60,
+                            1,
+                        ),
                 }
             )
 
+        # Horizontal table instead of chart-key rendering.
+        st.dataframe(
+            category_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
         st.bar_chart(
             {
-                item["Category"]: item["Minutes"]
-                for item in category_data
+                "Minutes": {
+                    item["category"]
+                    .replace("_", " "):
+                    round(
+                        item["seconds"] / 60,
+                        1,
+                    )
+                    for item
+                    in stats["categories"]
+                }
             }
         )
 
     else:
 
         st.info(
-            "Study-category analytics will appear "
-            "after you complete focus sessions."
+            "Complete focus sessions to generate category analytics."
         )
 
     st.divider()
 
     # --------------------------------------------------------
-    # DAILY ANALYSIS
+    # DAILY TABLE
     # --------------------------------------------------------
 
     st.subheader(
-        "📅 Recent Daily Study Time"
+        "📅 Daily Study History"
     )
 
     if stats["daily"]:
 
-        daily_data = {}
+        daily_rows = []
 
-        for row in reversed(
+        for item in reversed(
             stats["daily"]
         ):
 
-            daily_data[
-                row["study_date"]
+            daily_rows.append(
+                {
+                    "Date":
+                        item["study_date"],
+                    "Study Time (minutes)":
+                        round(
+                            item["seconds"]
+                            / 60,
+                            1,
+                        ),
+                }
+            )
+
+        st.dataframe(
+            daily_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        daily_chart = {}
+
+        for item in reversed(
+            stats["daily"]
+        ):
+
+            daily_chart[
+                item["study_date"]
             ] = round(
-                row["seconds"]
-                / 60,
+                item["seconds"] / 60,
                 1,
             )
 
         st.line_chart(
-            daily_data
+            daily_chart
         )
 
     else:
 
         st.info(
-            "Daily analytics will appear after study activity."
+            "Daily study history will appear after focus sessions."
         )
 
     st.divider()
 
     # --------------------------------------------------------
-    # TARGET ANALYSIS
+    # MASTERY
     # --------------------------------------------------------
 
     st.subheader(
-        "🎯 Target Analysis"
+        "🧠 Topic Performance"
     )
 
-    daily_target = user[
-        "daily_target"
-    ]
+    conn = get_db()
 
-    weekly_target = user[
-        "weekly_target"
-    ]
+    mastery_rows = conn.execute(
+        """
+        SELECT
+            subject,
+            topic,
+            attempts,
+            correct,
+            accuracy,
+            mastery_status,
+            weakness_score
+        FROM study_progress
+        WHERE user_id = ?
+        AND attempts > 0
+        ORDER BY weakness_score DESC
+        """,
+        (
+            user["id"],
+        ),
+    ).fetchall()
 
-    today_minutes = (
-        stats["today"] // 60
-    )
+    conn.close()
 
-    week_minutes = (
-        stats["week"] // 60
-    )
+    if mastery_rows:
 
-    target_rows = [
-        {
-            "Target": "Daily",
-            "Target Minutes": daily_target,
-            "Completed Minutes": today_minutes,
-            "Remaining": max(
-                0,
-                daily_target
-                - today_minutes,
-            ),
-        },
-        {
-            "Target": "Weekly",
-            "Target Minutes": weekly_target,
-            "Completed Minutes": week_minutes,
-            "Remaining": max(
-                0,
-                weekly_target
-                - week_minutes,
-            ),
-        },
-    ]
+        mastery_data = []
 
-    st.dataframe(
-        target_rows,
-        use_container_width=True,
-        hide_index=True,
-    )
+        for row in mastery_rows:
+
+            mastery_data.append(
+                {
+                    "Subject": row["subject"],
+                    "Topic": row["topic"],
+                    "Attempts": row["attempts"],
+                    "Correct": row["correct"],
+                    "Accuracy (%)": round(
+                        row["accuracy"],
+                        1,
+                    ),
+                    "Mastery": row[
+                        "mastery_status"
+                    ],
+                    "Weakness Score": round(
+                        row["weakness_score"],
+                        1,
+                    ),
+                }
+            )
+
+        st.dataframe(
+            mastery_data,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.info(
+            "Solve practice questions to generate topic mastery data."
+        )
 
 
 # ============================================================
 # STUDY PLANNER
 # ============================================================
 
-
 def study_planner_page(user):
 
     st.title("🗓️ Study Planner")
-
-    st.caption(
-        "Create a personal study plan using your actual targets."
-    )
 
     selected_date = st.date_input(
         "Study Date",
@@ -2664,8 +3467,8 @@ def study_planner_page(user):
         SYLLABUS[subject],
     )
 
-    planned_minutes = st.number_input(
-        "Planned Study Time (minutes)",
+    minutes = st.number_input(
+        "Planned Minutes",
         min_value=15,
         max_value=720,
         value=60,
@@ -2673,7 +3476,7 @@ def study_planner_page(user):
     )
 
     if st.button(
-        "➕ Add Study Plan",
+        "➕ Add Plan",
         type="primary",
         use_container_width=True,
     ):
@@ -2692,20 +3495,20 @@ def study_planner_page(user):
                 status,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'PLANNED', ?)
             """,
             (
                 user["id"],
                 selected_date.isoformat(),
                 subject,
                 topic,
-                planned_minutes,
-                "PLANNED",
+                minutes,
                 now().isoformat(),
             ),
         )
 
         conn.commit()
+
         conn.close()
 
         st.success(
@@ -2716,16 +3519,11 @@ def study_planner_page(user):
 
     st.divider()
 
-    st.subheader(
-        "📋 Your Study Plan"
-    )
-
     conn = get_db()
 
     plans = conn.execute(
         """
         SELECT
-            id,
             plan_date,
             subject,
             topic,
@@ -2733,9 +3531,7 @@ def study_planner_page(user):
             status
         FROM study_plan
         WHERE user_id = ?
-        ORDER BY
-            plan_date ASC,
-            id ASC
+        ORDER BY plan_date ASC
         """,
         (
             user["id"],
@@ -2746,32 +3542,23 @@ def study_planner_page(user):
 
     if plans:
 
-        rows = []
+        data = []
 
-        for plan in plans:
+        for row in plans:
 
-            rows.append(
+            data.append(
                 {
-                    "Date": plan[
-                        "plan_date"
-                    ],
-                    "Subject": plan[
-                        "subject"
-                    ],
-                    "Topic": plan[
-                        "topic"
-                    ],
-                    "Planned Minutes": plan[
-                        "planned_minutes"
-                    ],
-                    "Status": plan[
-                        "status"
-                    ],
+                    "Date": row["plan_date"],
+                    "Subject": row["subject"],
+                    "Topic": row["topic"],
+                    "Planned Minutes":
+                        row["planned_minutes"],
+                    "Status": row["status"],
                 }
             )
 
         st.dataframe(
-            rows,
+            data,
             use_container_width=True,
             hide_index=True,
         )
@@ -2779,14 +3566,13 @@ def study_planner_page(user):
     else:
 
         st.info(
-            "No study plans created yet."
+            "No study plans yet."
         )
 
 
 # ============================================================
 # PROFILE
 # ============================================================
-
 
 def profile_page(user):
 
@@ -2829,59 +3615,48 @@ def profile_page(user):
             step=30,
         )
 
-        submitted = st.form_submit_button(
+        if st.form_submit_button(
             "Save Profile",
             use_container_width=True,
-        )
+        ):
 
-        if submitted:
+            conn = get_db()
 
-            if weekly < daily:
+            conn.execute(
+                """
+                UPDATE users
+                SET
+                    full_name = ?,
+                    gate_branch = ?,
+                    target_year = ?,
+                    daily_target = ?,
+                    weekly_target = ?
+                WHERE id = ?
+                """,
+                (
+                    name.strip(),
+                    branch.strip(),
+                    year,
+                    daily,
+                    weekly,
+                    user["id"],
+                ),
+            )
 
-                st.error(
-                    "Weekly target should normally be "
-                    "greater than or equal to the daily target."
-                )
+            conn.commit()
 
-            else:
+            conn.close()
 
-                conn = get_db()
+            st.success(
+                "Profile updated."
+            )
 
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET
-                        full_name = ?,
-                        gate_branch = ?,
-                        target_year = ?,
-                        daily_target = ?,
-                        weekly_target = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        name.strip(),
-                        branch.strip(),
-                        year,
-                        daily,
-                        weekly,
-                        user["id"],
-                    ),
-                )
-
-                conn.commit()
-                conn.close()
-
-                st.success(
-                    "Profile updated."
-                )
-
-                st.rerun()
+            st.rerun()
 
 
 # ============================================================
 # MAIN APPLICATION
 # ============================================================
-
 
 if not st.session_state.logged_in:
 
@@ -2893,18 +3668,15 @@ else:
         st.session_state.user_id
     )
 
-    if user is None:
+    if not user:
 
-        for key, value in DEFAULT_SESSION_VALUES.items():
+        for key, value in DEFAULT_STATE.items():
+
             st.session_state[key] = value
 
         st.rerun()
 
     page = sidebar(user)
-
-    # --------------------------------------------------------
-    # ROUTING
-    # --------------------------------------------------------
 
     if page == "🏠 Dashboard":
 
@@ -2920,7 +3692,7 @@ else:
 
     elif page == "📝 Practice":
 
-        practice_page()
+        practice_page(user)
 
     elif page == "📄 PYQs":
 
@@ -2928,11 +3700,19 @@ else:
 
     elif page == "🔄 Revision":
 
-        revision_page()
+        revision_page(user)
 
     elif page == "📊 Analytics":
 
         analytics_page(user)
+
+    elif page == "🧠 Adaptive Engine":
+
+        adaptive_engine_page(user)
+
+    elif page == "📝 CBT Test":
+
+        cbt_page(user)
 
     elif page == "🗓️ Study Planner":
 
